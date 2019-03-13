@@ -4,6 +4,7 @@ namespace Queue\Model\Table;
 
 use Cake\Core\Configure;
 use Cake\I18n\Time;
+use Queue\Model\Entity\QueuedTask;
 use Cake\ORM\Table;
 use Exception;
 use RecursiveDirectoryIterator;
@@ -77,12 +78,12 @@ class QueuedTasksTable extends Table {
 	 * @param string $jobName   QueueTask name
 	 * @param array|null $data      any array
 	 * @param array|null $notBefore optional date which must not be preceded
-	 * @param string|null $group     Used to group similar QueuedTasks.
-	 * @param string|null $reference An optional reference string.
+	 * @param int|0 $group     Used to group high/low priority QueuedTasks.
+	 * @param int|0 $reference An optional reference (Batch Id referance).
 	 * @return \Cake\ORM\Entity Saved job entity
 	 * @throws \Exception
 	 */
-	public function createJob($jobName, $data = null, $notBefore = null, $group = null, $reference = null) {
+	public function createJob($jobName, $data = null, $notBefore = null, $group = QueuedTask::LOW_PRIORITY, $reference = 0) {
 		$data = [
 			'jobtype' => $jobName,
 			'data' => serialize($data),
@@ -197,6 +198,7 @@ class QueuedTasksTable extends Table {
 			],
 			'order' => [
 				'age ASC',
+				'failed ASC', //DK: fetch failed task last
 				'id ASC',
 			]
 		];
@@ -232,31 +234,38 @@ class QueuedTasksTable extends Table {
 			}
 			$findCond['conditions']['OR'][] = $tmp;
 		}
-
-		$job = $query->find('all', $findCond)
+		$job = null;
+		$this->connection()->transactional(function() use ($query, $findCond, $now, &$job)
+		{
+			$job = $query->find('all', $findCond)
 			->autoFields(true)
+			->epilog('FOR UPDATE')
 			->first();
 
-		if (!$job) {
+			if (!isset($job)) {
+				return true;
+			}
+
+			if ($job->fetched) {
+				$job = $this->patchEntity($job, [
+					'failed' => $job->failed + 1,
+					'message' => 'Restart after timeout'
+				]);
+
+				$this->save($job, ['fieldList' => ['id', 'failed', 'message']]);
+			} 
+			$key = $this->key();
+			$job = $this->patchEntity($job, [
+				'workerkey' => $key,
+				'fetched' => $now
+			]);
+
+			$this->save($job);
+		});
+		if (!isset($job)) {
 			return null;
 		}
 
-		if ($job->fetched) {
-			$job = $this->patchEntity($job, [
-				'failed' => $job->failed + 1,
-				'failure_message' => 'Restart after timeout'
-			]);
-
-			$this->save($job, ['fieldList' => ['id', 'failed', 'failure_message']]);
-		}
-
-		$key = $this->key();
-		$job = $this->patchEntity($job, [
-			'workerkey' => $key,
-			'fetched' => $now
-		]);
-
-		$this->save($job);
 		$this->rateHistory[$job['jobtype']] = $now->toUnixString();
 
 		return $job;
@@ -304,7 +313,7 @@ class QueuedTasksTable extends Table {
 			'progress' => 0,
 			'failed' => 0,
 			'workerkey' => null,
-			'failure_message' => null,
+			'message' => null,
 		];
 		$conditions = [
 			'completed IS' => null,
@@ -316,17 +325,17 @@ class QueuedTasksTable extends Table {
 	 * Mark a job as Failed, Incrementing the failed-counter and Requeueing it.
 	 *
 	 * @param int $id ID of task
-	 * @param string|null $failureMessage Optional message to append to the failure_message field.
+	 * @param string|null $failureMessage Optional message to append to the message field.
 	 * @return bool Success
 	 */
 	public function markJobFailed($id, $failureMessage = null) {
 		$db = $this->get($id);
 		if ($failureMessage === null) {
-			$failureMessage = $db->failure_message;
+			$failureMessage = $db->message;
 		}
 		$fields = [
 			'failed = failed + 1',
-			'failure_message' => $failureMessage,
+			'message' => $failureMessage,
 		];
 		$conditions = [
 			'id' => $id,
@@ -349,7 +358,7 @@ class QueuedTasksTable extends Table {
 				'progress',
 				'reference',
 				'failed',
-				'failure_message',
+				'message',
 			],
 			'conditions' => [
 				'completed IS' => null,
@@ -421,7 +430,7 @@ class QueuedTasksTable extends Table {
 				'reference',
 				'status',
 				'progress',
-				'failure_message',
+				'message',
 			];
 			if (isset($query['conditions']['exclude'])) {
 				$exclude = $query['conditions']['exclude'];
@@ -449,8 +458,8 @@ class QueuedTasksTable extends Table {
 			if (!empty($result['progress'])) {
 				$results[$k]['progress'] = $result['progress'];
 			}
-			if (!empty($result['failure_message'])) {
-				$results[$k]['failure_message'] = $result['failure_message'];
+			if (!empty($result['message'])) {
+				$results[$k]['message'] = $result['message'];
 			}
 		}
 		return $results;
